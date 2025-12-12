@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-STU 潮汐反演（S 极窄范围锁定版）
+STU 潮汐反演（S 波动抑制版 + 固定文件路径）
 ----------------------------------------------------
 修改点：
-1. S_GLOBAL_RANGE_LOG = 0.02：强制 S 全程波动不超过 ±5%。
-2. cfg["S"] = (4e-5, 6e-5)：硬性物理范围进一步缩窄。
-3. TRUST_RADIUS = 0.05：增加逐日惯性。
+1. 【相位降权】：misfit 中降低相位权重，防止 S 因相位噪声跳动。
+2. 【严格限速】：TRUST_RADIUS = 0.01，强制连续。
+3. 【固定文件】：直接指定文件路径，不再弹窗。
 """
 
 import numpy as np
@@ -19,8 +19,6 @@ from scipy.special import kv
 from scipy.optimize import minimize
 import optuna
 import os
-import tkinter as tk
-from tkinter import filedialog
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -31,31 +29,37 @@ plt.rcParams['axes.unicode_minus'] = False
 plt.rcParams['xtick.direction'] = 'in'
 plt.rcParams['ytick.direction'] = 'in'
 
-# ================= 用户参数 (核心调优区) =================
+# ================= 用户参数 =================
 
-HALF_WINDOW = 3   
+# 0. 固定文件路径 (请修改为你自己的路径)
+# 注意：Windows路径建议用双反斜杠 \\ 或反斜杠 /
+DATA_FILE_PATH = r"E:\临时\STU_VERSION-----\amp_pha_111111111.dat"  # <--- 修改这里！
+
+# 1. 滑窗半径 (适当增大以平滑)
+HALF_WINDOW = 5   
+
+# 2. 信任域 (限速器)
+# 0.01 表示相邻点变化不能超过 2.3%，这能有效消除锯齿
+TRUST_RADIUS = 0.01
+
+# 3. 权重因子 (关键修改)
+WEIGHT_AMP = 10.0  # 重视振幅 (控制 T)
+WEIGHT_PHA = 0.1   # 轻视相位 (控制 S，防止乱跳)
+
+# 4. 自动分类配置
 COARSE_TRIALS = 30
 COARSE_POINTS = 20
 
-# 1. 信任域 (逐日变化限制)
-# 改为 0.05 (允许每天变化 12%)，增加稳定性
-TRUST_RADIUS = 0.05
-
-# 2. S 的全局波动范围限制 (Log10单位)
-# 改为 0.02 (允许全程波动 ±4.7%)，极度稳定，接近直线
-S_GLOBAL_RANGE_LOG = 0.02  
-
 # ================= 物理模型 =================
 rc=0.171/2; rw=0.150/2; bp=26.26; b=40.44; S_S=1e-5; zi=-29.8; wm2=2*np.pi/0.5175/86400
-
-# 粗反演范围
-COARSE_BOUNDS = dict(S=(1e-5, 9e-5), T=(1e-6, 1e-2), U=(1e-10, 1e-5))
-
-def select_data_file():
-    root = tk.Tk(); root.withdraw()
-    file_path = filedialog.askopenfilename(title="选择数据文件")
-    if not file_path: raise FileNotFoundError("未选择文件")
-    return file_path
+AQUIFER_CONFIG = {
+    1: dict(S=(1e-5,1e-3),  T=(1e-4,1e-2),  U=(1e-7,1e-5)),
+    2: dict(S=(5e-6,5e-4),  T=(1e-6,1e-3),  U=(1e-8,1e-6)),
+    3: dict(S=(1e-6,1e-4),  T=(1e-7,1e-5),  U=(1e-9,1e-7)),
+    4: dict(S=(1e-6,1e-4),  T=(1e-8,1e-4),  U=(1e-9,1e-6)),
+    5: dict(S=(1e-6,5e-4),  T=(1e-9,1e-6),  U=(1e-11,1e-8)),
+}
+COARSE_BOUNDS = dict(S=(1e-6, 1e-4), T=(1e-6, 1e-4), U=(1e-10, 1e-7))
 
 def forward(x, AR, pin):
     S, T, U = x
@@ -70,96 +74,118 @@ def forward(x, AR, pin):
     q1 = amp - AR*Ss; q2 = pha - pin
     return np.array([q1, q2, q1+q2])
 
-def misfit_window_gaussian(x, AR_chunk, pin_chunk):
+# ============ 修改后的 misfit (带权重 + 忽略断点) ============
+def misfit_weighted_masked(x, AR_chunk, pin_chunk, time_weights):
     S, T, U = x
     if S <= 0 or T <= 0 or U <= 0: return 1e99
+    
     n = len(AR_chunk)
-    sigma = n / 4.0  
-    center = (n - 1) / 2.0
-    indices = np.arange(n)
-    weights = np.exp(-0.5 * ((indices - center) / sigma) ** 2)
-    err = 0.0; weight_sum = 0.0
+    err = 0.0
+    weight_sum = 0.0
+    
     for i in range(n):
+        if time_weights[i] <= 1e-6: continue
+        
         q1, q2, _ = forward(x, AR_chunk[i], pin_chunk[i])
-        w = weights[i]
-        err += (q1**2 + q2**2) * w
+        w = time_weights[i]
+        
+        # 【关键修改】分别加权
+        term_amp = (q1 * WEIGHT_AMP) ** 2
+        term_pha = (q2 * WEIGHT_PHA) ** 2
+        
+        err += (term_amp + term_pha) * w
         weight_sum += w
+        
+    if weight_sum == 0: return 1e99
     return err / weight_sum
 
-def calculate_global_median_S(AR, pin, cfg):
-    print(">>> 正在计算全局 S 中值...")
-    step = max(1, len(AR) // 30)
-    S_list = []
-    def obj(trial):
-        S = trial.suggest_float("S", cfg["S"][0], cfg["S"][1], log=True)
-        T = trial.suggest_float("T", cfg["T"][0], cfg["T"][1], log=True)
-        U = trial.suggest_float("U", cfg["U"][0], cfg["U"][1], log=True)
-        q1, q2, _ = forward([S,T,U], ar_val, pin_val)
-        return q1**2 + q2**2
-    for i in range(0, len(AR), step):
-        ar_val, pin_val = AR[i], pin[i]
-        study = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler())
-        study.optimize(obj, n_trials=20, show_progress_bar=False)
-        S_list.append(study.best_params["S"])
-    S_median = np.median(S_list)
-    print(f"    全局 S 中值 = {S_median:.2e}")
-    return S_median
-
-def optimize_step_scipy(AR_chunk, pin_chunk, x0, cfg, s_median_log):
-    def obj_log(log_x): return misfit_window_gaussian(10**log_x, AR_chunk, pin_chunk)
+def optimize_step_scipy(AR_chunk, pin_chunk, x0, cfg, time_weights):
+    # 使用带权重的 misfit
+    def obj_log(log_x): 
+        return misfit_weighted_masked(10**log_x, AR_chunk, pin_chunk, time_weights)
+    
     log_x0 = np.log10(x0)
     bounds = []
     for k, lx in zip(["S","T","U"], log_x0):
-        gmin_phys, gmax_phys = np.log10(cfg[k])
-        
-        if k == "S":
-            # 核心：极窄的动态范围
-            gmin_anchor = s_median_log - S_GLOBAL_RANGE_LOG
-            gmax_anchor = s_median_log + S_GLOBAL_RANGE_LOG
-            gmin = max(gmin_phys, gmin_anchor)
-            gmax = min(gmax_phys, gmax_anchor)
-        else:
-            gmin, gmax = gmin_phys, gmax_phys
-            
-        bmin = max(gmin, lx - TRUST_RADIUS)
-        bmax = min(gmax, lx + TRUST_RADIUS)
-        if bmax < bmin: 
-            center = (gmin + gmax) / 2
-            bmin = max(gmin, center - TRUST_RADIUS)
-            bmax = min(gmax, center + TRUST_RADIUS)
-        bounds.append((bmin, bmax))
+        gmin, gmax = np.log10(cfg[k])
+        # 信任域限制 (TRUST_RADIUS)
+        bounds.append((max(gmin, lx - TRUST_RADIUS), min(gmax, lx + TRUST_RADIUS)))
     res = minimize(obj_log, log_x0, method='L-BFGS-B', bounds=bounds)
     return 10**res.x
 
 def optimize_init_optuna(AR_chunk, pin_chunk, cfg):
+    Smin, Smax = cfg["S"]; Tmin, Tmax = cfg["T"]; Umin, Umax = cfg["U"]
     def objective(trial):
-        S = trial.suggest_float("S", cfg["S"][0], cfg["S"][1], log=True)
-        T = trial.suggest_float("T", cfg["T"][0], cfg["T"][1], log=True)
-        U = trial.suggest_float("U", cfg["U"][0], cfg["U"][1], log=True)
-        return misfit_window_gaussian([S, T, U], AR_chunk, pin_chunk)
+        S = trial.suggest_float("S", Smin, Smax, log=True)
+        T = trial.suggest_float("T", Tmin, Tmax, log=True)
+        U = trial.suggest_float("U", Umin, Umax, log=True)
+        # 初始化也用简单的加权 misfit (无时间权重)
+        q1, q2, _ = forward([S,T,U], AR_chunk[0], pin_chunk[0])
+        err = (q1*WEIGHT_AMP)**2 + (q2*WEIGHT_PHA)**2
+        return err
     study = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler())
     study.optimize(objective, n_trials=30, show_progress_bar=False)
     bp = study.best_params
     return np.array([bp["S"], bp["T"], bp["U"]])
 
-def run_directional_pass(AR, pin, cfg, s_median, init_guess=None):
+def run_directional_pass(AR, pin, dates, cfg, init_guess=None):
     n = len(AR)
     S_res = np.zeros(n); T_res = np.zeros(n); U_res = np.zeros(n)
     prev_x = init_guess
-    s_median_log = np.log10(s_median)
     for i in range(n):
         idx_start = max(0, i - HALF_WINDOW)
         idx_end   = min(n, i + HALF_WINDOW + 1)
-        AR_c  = AR[idx_start:idx_end]; pin_c = pin[idx_start:idx_end]
+        AR_c  = AR[idx_start:idx_end]; pin_c = pin[idx_start:idx_end]; dates_c = dates[idx_start:idx_end]
+        
+        curr_len = len(AR_c); rel_center = i - idx_start
+        idxs = np.arange(curr_len)
+        sigma = max(1.0, curr_len / 4.0)
+        weights = np.exp(-0.5 * ((idxs - rel_center) / sigma) ** 2)
+        
+        center_date = dates[i]
+        for k in range(curr_len):
+            day_diff = abs((dates_c[k] - center_date).days)
+            if day_diff > (HALF_WINDOW * 1.5): weights[k] = 0.0
+                
+        if weights.sum() > 0: weights /= weights.sum()
+        else: weights = np.ones(curr_len)/curr_len
+        
         if prev_x is None: best_x = optimize_init_optuna(AR_c, pin_c, cfg)
-        else: best_x = optimize_step_scipy(AR_c, pin_c, prev_x, cfg, s_median_log)
+        else: best_x = optimize_step_scipy(AR_c, pin_c, prev_x, cfg, weights)
+            
         S_res[i], T_res[i], U_res[i] = best_x
         prev_x = best_x
     return S_res, T_res, U_res
 
-def plot_dense_ticks(dates, S, T, U, Misfit, filename):
+def auto_select_aquifer_type(AR, pin):
+    print("\n>>> 自动判断含水层类型...")
+    m = min(len(AR), COARSE_POINTS)
+    S_l, T_l, U_l = [], [], []
+    for i in range(m):
+        # 这里的粗反演不加权，只做量级判断
+        def obj(trial):
+            S = trial.suggest_float("S", *COARSE_BOUNDS["S"], log=True)
+            T = trial.suggest_float("T", *COARSE_BOUNDS["T"], log=True)
+            U = trial.suggest_float("U", *COARSE_BOUNDS["U"], log=True)
+            q1, q2, _ = forward([S,T,U], AR[i], pin[i])
+            return q1**2 + q2**2
+        study = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler())
+        study.optimize(obj, n_trials=15, show_progress_bar=False)
+        bp = study.best_params
+        S_l.append(bp["S"]); T_l.append(bp["T"]); U_l.append(bp["U"])
+        
+    S_med = np.median(np.log10(S_l)); T_med = np.median(np.log10(T_l)); U_med = np.median(np.log10(U_l))
+    best_t, best_d = None, 1e99
+    for k, cfg in AQUIFER_CONFIG.items():
+        Sm = np.mean(np.log10(cfg["S"])); Tm = np.mean(np.log10(cfg["T"])); Um = np.mean(np.log10(cfg["U"]))
+        d = abs(S_med - Sm) + abs(T_med - Tm) + abs(U_med - Um)
+        if d < best_d: best_d = d; best_t = k
+    print(f"    判定类型: {best_t}")
+    return best_t
+
+def plot_robust_labels(dates, S, T, U, Misfit, aq_type, filename):
     fig, axes = plt.subplots(4, 1, figsize=(10, 12), sharex=True)
-    plt.subplots_adjust(hspace=0.12) 
+    plt.subplots_adjust(hspace=0.1) 
     data_list = [S, T, U]
     labels = [r'$S$ (Storage)', r'$T$ (Transmissivity)', r'$U$ (Leakage)']
     colors = ['#d62728', '#1f77b4', '#2ca02c']
@@ -168,14 +194,10 @@ def plot_dense_ticks(dates, S, T, U, Misfit, filename):
         ax.plot(dates, data_list[i], color=colors[i], linewidth=1.5, label=labels[i])
         ax.set_ylabel(labels[i].split()[0], fontsize=12, fontweight='bold')
         ax.set_yscale('log')
-        
-        # 密集刻度设置
-        dense_subs = np.arange(1.0, 10.0, 0.2)
-        maj_loc = ticker.LogLocator(base=10.0, subs=dense_subs, numticks=20)
+        maj_loc = ticker.LogLocator(base=10.0, subs=np.arange(1, 10), numticks=15)
         ax.yaxis.set_major_locator(maj_loc)
         maj_fmt = ticker.FormatStrFormatter('%.1e')
         ax.yaxis.set_major_formatter(maj_fmt)
-        
         ax.grid(True, which='major', linestyle='-', linewidth=0.7, alpha=0.6)
         ax.grid(True, which='minor', linestyle=':', linewidth=0.5, alpha=0.3)
         ax.tick_params(which='both', direction='in', top=True, right=True)
@@ -187,7 +209,6 @@ def plot_dense_ticks(dates, S, T, U, Misfit, filename):
     formatter = ticker.ScalarFormatter(useMathText=True)
     formatter.set_powerlimits((-2, 3))
     ax4.yaxis.set_major_formatter(formatter)
-    ax4.yaxis.set_major_locator(ticker.MaxNLocator(nbins=6))
     ax4.grid(True, which='major', linestyle='-', alpha=0.6)
     ax4.tick_params(which='both', direction='in', top=True, right=True)
     ax4.legend(loc='upper right')
@@ -199,59 +220,51 @@ def plot_dense_ticks(dates, S, T, U, Misfit, filename):
     plt.setp(ax4.xaxis.get_majorticklabels(), rotation=30, ha='right')
     ax4.set_xlabel('Date', fontsize=12, fontweight='bold')
     
-    fig.suptitle(f'Inversion Results (S Tightly Locked)', fontsize=14, y=0.92)
+    fig.suptitle(f'Inversion Results (Type {aq_type}, Weighted)', fontsize=14, y=0.92)
     plt.savefig(filename, dpi=300, bbox_inches='tight')
     print(f"已绘图: {filename}")
     plt.show()
 
 def main():
-    data_file = select_data_file()
-    base = os.path.splitext(os.path.basename(data_file))[0]
+    # 1. 检查文件是否存在
+    if not os.path.exists(DATA_FILE_PATH):
+        print(f"错误: 找不到文件 {DATA_FILE_PATH}")
+        print("请在代码开头 DATA_FILE_PATH 处修改路径。")
+        return
+        
+    base = os.path.splitext(os.path.basename(DATA_FILE_PATH))[0]
+    print(f"处理文件: {base}")
     
     dates, HA, HP, EA, EP = [], [], [], [], []
-    with open(data_file, "r") as f:
+    with open(DATA_FILE_PATH, "r") as f:
         for line in f:
             p = line.split()
             if len(p)<5: continue
-            dates.append(datetime.strptime(p[0], "%Y/%m/%d"))
-            HA.append(float(p[1])); HP.append(float(p[2]))
-            EA.append(float(p[3])); EP.append(float(p[4]))
+            try:
+                d = datetime.strptime(p[0], "%Y/%m/%d")
+                ha, hp, ea, ep = map(float, p[1:5])
+                dates.append(d); HA.append(ha); HP.append(hp); EA.append(ea); EP.append(ep)
+            except: pass
+            
     dates = np.array(dates); n = len(dates)
     AR = (np.array(HA)/np.array(EA)) * 1e9
     pin = np.array(HP) - np.array(EP)
 
-    # --------------------------------------------------------
-    # 【核心修改区】更严格的参数范围
-    # --------------------------------------------------------
-    cfg = {
-        # 1. 物理硬边界：进一步缩窄到 1e-5 ~ 3e-5
-        "S": (1.0e-5, 3.0e-5),  
-        
-        # T 和 U 保持宽范围
-        "T": (1e-7, 1e-2),
-        "U": (1e-10, 1e-5)
-    }
-    
-    print(f"\n>>> 强制配置参数范围 (更严格):")
-    print(f"    S: {cfg['S']}")
-    print(f"    T: {cfg['T']}")
-    print(f"    U: {cfg['U']}")
+    aq_type = auto_select_aquifer_type(AR, pin)
+    cfg = AQUIFER_CONFIG[aq_type]
 
-    # 1. 计算中值
-    s_median = calculate_global_median_S(AR, pin, cfg)
-
-    # 2. Forward
+    # 1. Forward
     print("\n>>> 1/3 Forward Pass...")
-    Sf, Tf, Uf = run_directional_pass(AR, pin, cfg, s_median, init_guess=None)
+    Sf, Tf, Uf = run_directional_pass(AR, pin, dates, cfg, init_guess=None)
     
-    # 3. Backward
+    # 2. Backward
     print(">>> 2/3 Backward Pass...")
-    AR_rev, pin_rev = AR[::-1], pin[::-1]
+    AR_rev, pin_rev, dates_rev = AR[::-1], pin[::-1], dates[::-1]
     init_rev = [Sf[-1], Tf[-1], Uf[-1]]
-    Sb_r, Tb_r, Ub_r = run_directional_pass(AR_rev, pin_rev, cfg, s_median, init_guess=init_rev)
+    Sb_r, Tb_r, Ub_r = run_directional_pass(AR_rev, pin_rev, dates_rev, cfg, init_guess=init_rev)
     Sb, Tb, Ub = Sb_r[::-1], Tb_r[::-1], Ub_r[::-1]
 
-    # 4. Fusion
+    # 3. Fusion
     print(">>> 3/3 Fusion...")
     w_fwd = np.linspace(0, 1, n)
     w_bwd = 1.0 - w_fwd
@@ -264,13 +277,13 @@ def main():
         q1, q2, q3 = forward([S_fin[i], T_fin[i], U_fin[i]], AR[i], pin[i])
         q_res[i] = [q1, q2, q3]
 
-    OUT_DATA = f"STU_StrictS_{base}.dat"
+    OUT_DATA = f"STU_Weighted_{base}.dat"
     np.savetxt(OUT_DATA, np.column_stack((S_fin, T_fin, U_fin, q_res)), header="S T U q1 q2 q3", comments='')
     print(f"\n已保存: {OUT_DATA}")
 
     # Plot
-    OUT_PNG = f"STU_StrictS_{base}.png"
-    plot_dense_ticks(dates, S_fin, T_fin, U_fin, q_res[:,2], OUT_PNG)
+    OUT_PNG = f"STU_Weighted_{base}.png"
+    plot_robust_labels(dates, S_fin, T_fin, U_fin, q_res[:,2], aq_type, OUT_PNG)
 
 if __name__ == "__main__":
     main()
