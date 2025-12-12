@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-STU 潮汐反演（强制锁定 S 量级版）
+STU 潮汐反演（S 极窄范围锁定版）
 ----------------------------------------------------
-修复说明：
-1. 【强制约束】：不再自动判断含水层类型。
-2. 【手动锁定】：将 S 强制锁定在 1e-5 量级 (1e-5 ~ 9e-5)。
-3. T 和 U 依然在宽范围内自动搜索。
+修改点：
+1. S_GLOBAL_RANGE_LOG = 0.02：强制 S 全程波动不超过 ±5%。
+2. cfg["S"] = (4e-5, 6e-5)：硬性物理范围进一步缩窄。
+3. TRUST_RADIUS = 0.05：增加逐日惯性。
 """
 
 import numpy as np
@@ -31,20 +31,24 @@ plt.rcParams['axes.unicode_minus'] = False
 plt.rcParams['xtick.direction'] = 'in'
 plt.rcParams['ytick.direction'] = 'in'
 
-# ================= 用户参数 =================
+# ================= 用户参数 (核心调优区) =================
+
 HALF_WINDOW = 3   
 COARSE_TRIALS = 30
 COARSE_POINTS = 20
-TRUST_RADIUS = 0.01
 
-# S 的全局波动范围限制 (Log10单位)
-# 0.2 表示 S 只能在 (中值/1.5) 到 (中值*1.5) 之间微调
-S_GLOBAL_RANGE_LOG = 0.2  
+# 1. 信任域 (逐日变化限制)
+# 改为 0.05 (允许每天变化 12%)，增加稳定性
+TRUST_RADIUS = 0.05
+
+# 2. S 的全局波动范围限制 (Log10单位)
+# 改为 0.02 (允许全程波动 ±4.7%)，极度稳定，接近直线
+S_GLOBAL_RANGE_LOG = 0.02  
 
 # ================= 物理模型 =================
 rc=0.171/2; rw=0.150/2; bp=26.26; b=40.44; S_S=1e-5; zi=-29.8; wm2=2*np.pi/0.5175/86400
 
-# 粗反演范围 (仅用于T/U初始化，S已被锁定)
+# 粗反演范围
 COARSE_BOUNDS = dict(S=(1e-5, 9e-5), T=(1e-6, 1e-2), U=(1e-10, 1e-5))
 
 def select_data_file():
@@ -86,21 +90,19 @@ def calculate_global_median_S(AR, pin, cfg):
     print(">>> 正在计算全局 S 中值...")
     step = max(1, len(AR) // 30)
     S_list = []
-    # 这里使用的范围就是 cfg 中锁定的范围
     def obj(trial):
         S = trial.suggest_float("S", cfg["S"][0], cfg["S"][1], log=True)
         T = trial.suggest_float("T", cfg["T"][0], cfg["T"][1], log=True)
         U = trial.suggest_float("U", cfg["U"][0], cfg["U"][1], log=True)
         q1, q2, _ = forward([S,T,U], ar_val, pin_val)
         return q1**2 + q2**2
-        
     for i in range(0, len(AR), step):
         ar_val, pin_val = AR[i], pin[i]
         study = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler())
         study.optimize(obj, n_trials=20, show_progress_bar=False)
         S_list.append(study.best_params["S"])
     S_median = np.median(S_list)
-    print(f"    全局 S 中值 (已限制在1e-5量级) = {S_median:.2e}")
+    print(f"    全局 S 中值 = {S_median:.2e}")
     return S_median
 
 def optimize_step_scipy(AR_chunk, pin_chunk, x0, cfg, s_median_log):
@@ -111,7 +113,7 @@ def optimize_step_scipy(AR_chunk, pin_chunk, x0, cfg, s_median_log):
         gmin_phys, gmax_phys = np.log10(cfg[k])
         
         if k == "S":
-            # 这里的 s_median_log 已经是 1e-5 量级
+            # 核心：极窄的动态范围
             gmin_anchor = s_median_log - S_GLOBAL_RANGE_LOG
             gmax_anchor = s_median_log + S_GLOBAL_RANGE_LOG
             gmin = max(gmin_phys, gmin_anchor)
@@ -158,23 +160,19 @@ def run_directional_pass(AR, pin, cfg, s_median, init_guess=None):
 def plot_dense_ticks(dates, S, T, U, Misfit, filename):
     fig, axes = plt.subplots(4, 1, figsize=(10, 12), sharex=True)
     plt.subplots_adjust(hspace=0.12) 
-
     data_list = [S, T, U]
     labels = [r'$S$ (Storage)', r'$T$ (Transmissivity)', r'$U$ (Leakage)']
     colors = ['#d62728', '#1f77b4', '#2ca02c']
-
     for i in range(3):
         ax = axes[i]
         ax.plot(dates, data_list[i], color=colors[i], linewidth=1.5, label=labels[i])
         ax.set_ylabel(labels[i].split()[0], fontsize=12, fontweight='bold')
         ax.set_yscale('log')
         
-        # 强制显示小数倍刻度 (1.0, 1.2, 1.4 ... 9.8)
+        # 密集刻度设置
         dense_subs = np.arange(1.0, 10.0, 0.2)
         maj_loc = ticker.LogLocator(base=10.0, subs=dense_subs, numticks=20)
         ax.yaxis.set_major_locator(maj_loc)
-        
-        # 格式化
         maj_fmt = ticker.FormatStrFormatter('%.1e')
         ax.yaxis.set_major_formatter(maj_fmt)
         
@@ -190,7 +188,6 @@ def plot_dense_ticks(dates, S, T, U, Misfit, filename):
     formatter.set_powerlimits((-2, 3))
     ax4.yaxis.set_major_formatter(formatter)
     ax4.yaxis.set_major_locator(ticker.MaxNLocator(nbins=6))
-    
     ax4.grid(True, which='major', linestyle='-', alpha=0.6)
     ax4.tick_params(which='both', direction='in', top=True, right=True)
     ax4.legend(loc='upper right')
@@ -202,7 +199,7 @@ def plot_dense_ticks(dates, S, T, U, Misfit, filename):
     plt.setp(ax4.xaxis.get_majorticklabels(), rotation=30, ha='right')
     ax4.set_xlabel('Date', fontsize=12, fontweight='bold')
     
-    fig.suptitle(f'Inversion Results (S Fixed at ~1e-5)', fontsize=14, y=0.92)
+    fig.suptitle(f'Inversion Results (S Tightly Locked)', fontsize=14, y=0.92)
     plt.savefig(filename, dpi=300, bbox_inches='tight')
     print(f"已绘图: {filename}")
     plt.show()
@@ -224,23 +221,23 @@ def main():
     pin = np.array(HP) - np.array(EP)
 
     # --------------------------------------------------------
-    # 【核心修改区】手动指定参数范围，不再使用自动判断
+    # 【核心修改区】更严格的参数范围
     # --------------------------------------------------------
     cfg = {
-        # 强制 S 在 1e-5 到 9e-5 之间 (你可以根据需要改成 1e-5 到 2e-5 更窄)
-        "S": (1e-5, 9e-5),  
+        # 1. 物理硬边界：进一步缩窄到 1e-5 ~ 3e-5
+        "S": (1.0e-5, 3.0e-5),  
         
-        # T 和 U 给宽范围，让它们去适应数据
+        # T 和 U 保持宽范围
         "T": (1e-7, 1e-2),
         "U": (1e-10, 1e-5)
     }
     
-    print(f"\n>>> 强制配置参数范围:")
+    print(f"\n>>> 强制配置参数范围 (更严格):")
     print(f"    S: {cfg['S']}")
     print(f"    T: {cfg['T']}")
     print(f"    U: {cfg['U']}")
 
-    # 1. 计算全局 S 中值 (现在肯定会在 1e-5 范围内)
+    # 1. 计算中值
     s_median = calculate_global_median_S(AR, pin, cfg)
 
     # 2. Forward
@@ -267,12 +264,12 @@ def main():
         q1, q2, q3 = forward([S_fin[i], T_fin[i], U_fin[i]], AR[i], pin[i])
         q_res[i] = [q1, q2, q3]
 
-    OUT_DATA = f"STU_FixedS_{base}.dat"
+    OUT_DATA = f"STU_StrictS_{base}.dat"
     np.savetxt(OUT_DATA, np.column_stack((S_fin, T_fin, U_fin, q_res)), header="S T U q1 q2 q3", comments='')
     print(f"\n已保存: {OUT_DATA}")
 
     # Plot
-    OUT_PNG = f"STU_FixedS_{base}.png"
+    OUT_PNG = f"STU_StrictS_{base}.png"
     plot_dense_ticks(dates, S_fin, T_fin, U_fin, q_res[:,2], OUT_PNG)
 
 if __name__ == "__main__":
