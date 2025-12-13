@@ -2,261 +2,312 @@
 # -*- coding: utf-8 -*-
 
 """
-STU 潮汐反演（全局正则化反演 Global Regularized Inversion）
-----------------------------------------------------
-核心升级：
-1. 【全局反演】：不再使用滑窗，而是将所有时间点作为一个整体进行优化。
-2. 【平滑约束】：在目标函数中加入一阶粗糙度惩罚 (Roughness Penalty)。
-3. 【ABIC思想】：通过调整平滑权重 (ALPHA)，在拟合差和曲线光滑度之间找到最佳平衡。
-
-这是解决 S 波动大、不连续问题的终极数学方案。
+STU 反演 - 方法三：粒子群优化 (PSO) [最终修复版]
+------------------------------------------------
+功能：
+1. 使用粒子群算法 (PSO) 进行全局搜索，不依赖梯度，不易陷入局部最优。
+2. 包含 robust (健壮) 的文件读取模块，解决日期格式错误。
+3. 包含自适应平滑模块，解决数据量少时的报错。
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-import matplotlib.ticker as ticker
-from datetime import datetime
 from scipy.special import kv
-from scipy.optimize import minimize
+from scipy.signal import savgol_filter
+from datetime import datetime
 import os
+import tkinter as tk
+from tkinter import filedialog
 import warnings
 
+# 忽略数值计算中的溢出警告
 warnings.filterwarnings("ignore")
 
-# 全局绘图参数
+# 全局绘图设置
 plt.rcParams['font.sans-serif'] = ['Arial', 'SimHei']
 plt.rcParams['axes.unicode_minus'] = False
-plt.rcParams['xtick.direction'] = 'in'
-plt.rcParams['ytick.direction'] = 'in'
 
-# ================= 用户参数 (ABIC 调优区) =================
+# ================= 1. 用户参数设置 =================
 
-# 固定文件路径
-DATA_FILE_PATH = r"E:\临时\STU_VERSION-----\amp_pha_111111111.dat"
+# 文件路径 (建议修改为你实际的路径)
+DATA_FILE_PATH = r"E:\临时\STU_VERSION-----\amp_pha_111111111.dat" 
 
-# 1. 平滑权重 (Alpha) - ABIC 的核心参数
-# 值越大，曲线越光滑（越接近直线），但拟合误差会增加。
-# 值越小，曲线越抖动（越贴近数据），但噪声会增加。
-# 建议尝试：0.1, 1.0, 10.0, 50.0
-ALPHA_S = 50.0   # S 的平滑权重 (给大一点，按住 S)
-ALPHA_T = 5.0    # T 的平滑权重
-ALPHA_U = 1.0    # U 的平滑权重
+# PSO 算法参数
+PARTICLE_COUNT = 40    # 粒子数量 (越多越准，但越慢)
+MAX_ITER = 60          # 每个时间点的迭代次数
+W = 0.5                # 惯性权重 (保持飞行速度)
+C1 = 1.5               # 个体学习因子 (向自己历史最好学)
+C2 = 1.5               # 群体学习因子 (向群体最好学)
 
-# 2. 权重因子 (数据拟合)
-WEIGHT_AMP = 10.0  # 振幅重要性
-WEIGHT_PHA = 0.1   # 相位重要性 (降权以防止 S 跳动)
-
-# 3. 物理约束范围 (Log10)
-# 可以在这里锁死 S 的量级
-BOUNDS_LOG = {
-    "S": (-5.0, -4.0),  # S 限制在 1e-5 ~ 1e-4
-    "T": (-7.0, -2.0),  # T 宽范围
-    "U": (-10.0, -5.0)  # U 宽范围
+# 搜索范围 (Log10) - 在这里锁定 S 的量级
+BOUNDS = {
+    "S": [-5.5, -3.5], # S 限制在 1e-5.5 ~ 1e-3.5
+    "T": [-7.0, -2.0], # T 宽范围
+    "U": [-10.0, -5.0] # U 宽范围
 }
 
-# ================= 物理模型 =================
+# 权重因子 (抑制 S 波动)
+WEIGHT_AMP = 10.0  # 重视振幅
+WEIGHT_PHA = 0.1   # 轻视相位
+
+# ================= 2. 物理模型 =================
 rc=0.171/2; rw=0.150/2; bp=26.26; b=40.44; S_S=1e-5; zi=-29.8; wm2=2*np.pi/0.5175/86400
 
 def forward(x, AR, pin):
+    """
+    物理前向模型
+    """
     S, T, U = x
-    if S <= 1e-15 or T <= 1e-15 or U <= 1e-15: return np.array([1e6, 1e6])
+    # 物理约束：防止负数或极小值
+    if S <= 1e-15 or T <= 1e-15 or U <= 1e-15: 
+        return 1e6, 1e6
     
-    # 物理方程
-    Ss, RKuB = S/b, (S*bp)/(b*S_S); K_K, D_D = U*bp, U*(bp**2)/S_S
-    delta = np.sqrt(2*D_D/wm2); A = 1j*wm2*S/T; B = K_K/T
-    C = (1+1j)/delta
-    
-    # 数值稳定性处理 (tanh)
-    C_zi = C*zi
-    if abs(C_zi) > 50: 
-        D_val = 1.0; term_NL = -1.0 # 极限情况
-    else:
-        D_val = 1.0/np.tanh(C_zi); term_NL = -np.tanh(C_zi/2.0)
+    try:
+        Ss = S/b
+        RKuB = (S*bp)/(b*S_S)
+        K_K = U*bp
+        D_D = U*(bp**2)/S_S
         
-    belta = np.sqrt(A - B*C*D_val)
-    E = 1j*wm2*rc**2 * kv(0, belta*rw); F = 2*T*belta*rw * kv(1, belta*rw)
-    sigma = 1 + E/F
-    H = S*1j*wm2 + K_K*C*RKuB*term_NL; M = sigma*(S*1j*wm2 - K_K*C*D_val)
-    hw = H/M
-    
-    q1 = np.abs(hw) - AR*(S/b)
-    q2 = (np.angle(hw)*180/np.pi) - pin
-    return np.array([q1, q2])
-
-# ============ 全局目标函数 (Global Objective Function) ============
-def global_objective(params_flat, AR_all, pin_all, n_points):
-    """
-    params_flat: 所有天数的参数铺平 [S0..Sn, T0..Tn, U0..Un] (log10 space)
-    """
-    # 还原参数矩阵
-    S_logs = params_flat[0:n_points]
-    T_logs = params_flat[n_points:2*n_points]
-    U_logs = params_flat[2*n_points:]
-    
-    S_vals = 10**S_logs
-    T_vals = 10**T_logs
-    U_vals = 10**U_logs
-    
-    total_misfit = 0.0
-    
-    # 1. Data Misfit (数据拟合项)
-    # 这里可以使用向量化加速，但为了物理清晰，写成循环
-    for i in range(n_points):
-        q1, q2 = forward([S_vals[i], T_vals[i], U_vals[i]], AR_all[i], pin_all[i])
-        # 加权残差
-        err = (q1 * WEIGHT_AMP)**2 + (q2 * WEIGHT_PHA)**2
-        total_misfit += err
+        delta = np.sqrt(2*D_D/wm2)
+        A = 1j*wm2*S/T
+        B = K_K/T
         
-    # 2. Regularization (平滑约束项) - 这就是 ABIC 里的 Roughness
-    # 计算相邻点的差分 (一阶导数)
-    diff_S = np.diff(S_logs)
-    diff_T = np.diff(T_logs)
-    diff_U = np.diff(U_logs)
-    
-    reg_S = np.sum(diff_S**2) * (ALPHA_S**2)
-    reg_T = np.sum(diff_T**2) * (ALPHA_T**2)
-    reg_U = np.sum(diff_U**2) * (ALPHA_U**2)
-    
-    # 总目标 = 拟合误差 + 平滑惩罚
-    total_cost = total_misfit + reg_S + reg_T + reg_U
-    return total_cost
-
-# ============ 辅助：生成初始猜测 ============
-def generate_initial_guess(AR, pin, n):
-    # 简单计算一个全局平均的最优解作为初值
-    # 这样优化器只需要微调，速度快
-    def obj_single(x):
-        idx = n // 2
-        q1, q2 = forward(10**x, AR[idx], pin[idx])
-        return q1**2 + q2**2
-    
-    res = minimize(obj_single, [-4.5, -4.0, -8.0], method='L-BFGS-B', 
-                   bounds=[BOUNDS_LOG["S"], BOUNDS_LOG["T"], BOUNDS_LOG["U"]])
-    
-    s0, t0, u0 = res.x
-    print(f">>> 初始猜测基准: S={10**s0:.2e}, T={10**t0:.2e}, U={10**u0:.2e}")
-    
-    # 铺平成长向量
-    init_S = np.full(n, s0)
-    init_T = np.full(n, t0)
-    init_U = np.full(n, u0)
-    return np.concatenate([init_S, init_T, init_U])
-
-# ============ 绘图函数 ============
-def plot_results(dates, S, T, U, q_res, filename):
-    fig, axes = plt.subplots(4, 1, figsize=(10, 12), sharex=True)
-    plt.subplots_adjust(hspace=0.1) 
-    
-    data = [S, T, U]
-    names = ['S', 'T', 'U']
-    colors = ['#d62728', '#1f77b4', '#2ca02c']
-    
-    for i in range(3):
-        ax = axes[i]
-        ax.plot(dates, data[i], color=colors[i], lw=2)
-        ax.set_ylabel(names[i], fontweight='bold')
-        ax.set_yscale('log')
+        C = (1+1j)/delta
+        C_zi = C*zi
         
-        # 强制显示密集刻度
-        ax.yaxis.set_major_locator(ticker.LogLocator(base=10.0, subs=np.arange(1,10), numticks=15))
-        ax.yaxis.set_major_formatter(ticker.FormatStrFormatter('%.1e'))
-        ax.grid(True, which='major', ls='-', alpha=0.6)
-        ax.grid(True, which='minor', ls=':', alpha=0.3)
-        ax.tick_params(direction='in', which='both', right=True)
+        # 数值稳定处理
+        if abs(C_zi) > 50: 
+            D_val = 1.0
+            term_NL = -1.0
+        else: 
+            D_val = 1.0/np.tanh(C_zi)
+            term_NL = -np.tanh(C_zi/2.0)
+        
+        belta = np.sqrt(A - B*C*D_val)
+        E = 1j*wm2*rc**2 * kv(0, belta*rw)
+        F = 2*T*belta*rw * kv(1, belta*rw)
+        
+        sigma = 1 + E/F
+        H = S*1j*wm2 + K_K*C*RKuB*term_NL
+        M = sigma*(S*1j*wm2 - K_K*C*D_val)
+        
+        hw = H/M
+        
+        q1 = np.abs(hw) - AR*Ss
+        q2 = (np.angle(hw)*180/np.pi) - pin
+        return q1, q2
+    except:
+        return 1e6, 1e6
 
-    # Misfit
-    ax4 = axes[3]
-    # 计算 q3 = q1 + q2 (近似)
-    misfit_val = np.sqrt(q_res[:,0]**2 + q_res[:,1]**2)
-    ax4.plot(dates, misfit_val, 'k-', lw=1)
-    ax4.set_ylabel('Misfit', fontweight='bold')
-    ax4.grid(True, ls='-', alpha=0.6)
-    ax4.tick_params(direction='in', which='both', right=True)
-    
-    ax4.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
-    plt.setp(ax4.xaxis.get_majorticklabels(), rotation=30, ha='right')
-    
-    fig.suptitle(f'Global Regularized Inversion (Alpha_S={ALPHA_S})', y=0.92)
-    plt.savefig(filename, dpi=300, bbox_inches='tight')
-    print(f"绘图完成: {filename}")
-    plt.show()
+# ================= 3. PSO 核心算法类 =================
+class PSO_Solver:
+    def __init__(self, AR_val, pin_val):
+        self.AR = AR_val
+        self.pin = pin_val
+        self.dim = 3 # S, T, U
+        
+        # 定义搜索边界
+        self.lb = np.array([BOUNDS["S"][0], BOUNDS["T"][0], BOUNDS["U"][0]])
+        self.ub = np.array([BOUNDS["S"][1], BOUNDS["T"][1], BOUNDS["U"][1]])
+        
+        # 初始化粒子群 (在 Log 空间均匀分布)
+        self.X = np.random.uniform(self.lb, self.ub, (PARTICLE_COUNT, self.dim))
+        self.V = np.random.uniform(-0.1, 0.1, (PARTICLE_COUNT, self.dim))
+        
+        # 记录最优解
+        self.pbest_X = self.X.copy()
+        self.pbest_score = np.full(PARTICLE_COUNT, np.inf)
+        self.gbest_X = np.zeros(self.dim)
+        self.gbest_score = np.inf
+        
+    def calculate_fitness(self, x_log):
+        """计算适应度 (Misfit)"""
+        params = 10**x_log # 还原为线性值
+        q1, q2 = forward(params, self.AR, self.pin)
+        
+        # 加权 Misfit: 压制相位权重，防止 S 乱跳
+        cost = (q1 * WEIGHT_AMP)**2 + (q2 * WEIGHT_PHA)**2
+        return cost
 
-# ============ 主程序 ============
+    def run(self):
+        """执行迭代"""
+        for i in range(MAX_ITER):
+            # 1. 计算适应度
+            for j in range(PARTICLE_COUNT):
+                score = self.calculate_fitness(self.X[j])
+                
+                # 更新个体最优
+                if score < self.pbest_score[j]:
+                    self.pbest_score[j] = score
+                    self.pbest_X[j] = self.X[j].copy()
+                
+                # 更新群体最优
+                if score < self.gbest_score:
+                    self.gbest_score = score
+                    self.gbest_X = self.X[j].copy()
+            
+            # 2. 更新速度和位置
+            r1 = np.random.rand(PARTICLE_COUNT, self.dim)
+            r2 = np.random.rand(PARTICLE_COUNT, self.dim)
+            
+            self.V = W * self.V + \
+                     C1 * r1 * (self.pbest_X - self.X) + \
+                     C2 * r2 * (self.gbest_X - self.X)
+            
+            self.X = self.X + self.V
+            
+            # 3. 边界限制 (Clip)
+            self.X = np.clip(self.X, self.lb, self.ub)
+            
+        return 10**self.gbest_X, self.gbest_score
+
+# ================= 4. 主程序 =================
+def select_file_gui():
+    """如果没有找到默认文件，弹出选择框"""
+    root = tk.Tk()
+    root.withdraw()
+    path = filedialog.askopenfilename(title="选择数据文件 (*.dat)")
+    return path
+
 def main():
-    if not os.path.exists(DATA_FILE_PATH):
-        print("错误: 文件不存在，请修改路径")
+    # 1. 确定文件路径
+    file_path = DATA_FILE_PATH
+    if not os.path.exists(file_path):
+        print(f"❌ 默认路径未找到: {file_path}")
+        print(">>> 请在弹窗中选择文件...")
+        file_path = select_file_gui()
+        if not file_path:
+            print("未选择文件，程序退出。")
+            return
+
+    # 2. 读取数据 (Robust Reading)
+    dates, AR, pin = [], [], []
+    print(f"正在读取文件: {os.path.basename(file_path)} ...")
+    
+    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+        line_num = 0
+        for line in f:
+            line_num += 1
+            p = line.split()
+            if len(p) < 5: continue
+            
+            try:
+                # 尝试解析日期 (兼容 / 和 -)
+                date_str = p[0]
+                try:
+                    d = datetime.strptime(date_str, "%Y/%m/%d")
+                except ValueError:
+                    d = datetime.strptime(date_str, "%Y-%m-%d")
+                
+                # 读取数值
+                ha, hp, ea, ep = map(float, p[1:5])
+                
+                # 简单清洗
+                if abs(ea) < 1e-9: continue # 除0保护
+                
+                ar_val = (ha / ea) * 1e9
+                pin_val = hp - ep
+                
+                dates.append(d)
+                AR.append(ar_val)
+                pin.append(pin_val)
+            except:
+                # 忽略解析错误的行（如表头）
+                continue
+    
+    n = len(dates)
+    if n == 0:
+        print("❌ 错误：文件中没有读取到有效数据！请检查日期格式。")
         return
     
-    print(f"读取文件: {DATA_FILE_PATH}")
-    dates, AR, pin = [], [], []
-    with open(DATA_FILE_PATH, 'r') as f:
-        for line in f:
-            p = line.split()
-            if len(p)<5: continue
-            try:
-                d = datetime.strptime(p[0], "%Y/%m/%d")
-                dates.append(d)
-                # AR = (HA/EA)*1e9, pin = HP - EP
-                AR.append(float(p[1])/float(p[3])*1e9)
-                pin.append(float(p[2])-float(p[4]))
-            except: pass
-            
-    dates = np.array(dates)
-    AR = np.array(AR)
-    pin = np.array(pin)
-    n = len(dates)
+    print(f"✅ 成功读取 {n} 个数据点。")
+    print(f">>> 开始 PSO 全局搜索 (Particles={PARTICLE_COUNT}, Iter={MAX_ITER})...")
     
-    print(f"数据点数: {n}")
+    # 3. 执行反演
+    S_res, T_res, U_res, Q_res = [], [], [], []
     
-    # 1. 生成初值
-    x0 = generate_initial_guess(AR, pin, n)
-    
-    # 2. 设置边界
-    # 我们需要为每一个点的每一个参数都设置边界
-    bounds = []
-    # S bounds
-    bounds.extend([BOUNDS_LOG["S"]] * n)
-    # T bounds
-    bounds.extend([BOUNDS_LOG["T"]] * n)
-    # U bounds
-    bounds.extend([BOUNDS_LOG["U"]] * n)
-    
-    # 3. 运行全局优化 (Global Optimization)
-    print(">>> 开始全局正则化反演 (这可能需要几秒到一分钟)...")
-    # L-BFGS-B 非常适合处理这种大规模边界约束问题
-    res = minimize(
-        global_objective, 
-        x0, 
-        args=(AR, pin, n), 
-        method='L-BFGS-B', 
-        bounds=bounds,
-        options={'disp': True, 'maxiter': 2000}
-    )
-    
-    print(f">>> 反演完成! Success: {res.success}, Msg: {res.message}")
-    
-    # 4. 解析结果
-    final_x = res.x
-    S_fin = 10**final_x[0:n]
-    T_fin = 10**final_x[n:2*n]
-    U_fin = 10**final_x[2*n:]
-    
-    # 计算残差
-    q_res = []
     for i in range(n):
-        q = forward([S_fin[i], T_fin[i], U_fin[i]], AR[i], pin[i])
-        q_res.append(q)
-    q_res = np.array(q_res)
+        solver = PSO_Solver(AR[i], pin[i])
+        best_stu, best_misfit = solver.run()
+        
+        S_res.append(best_stu[0])
+        T_res.append(best_stu[1])
+        U_res.append(best_stu[2])
+        Q_res.append(best_misfit)
+        
+        if (i+1) % 10 == 0 or i == n-1:
+            print(f"    进度: {i+1}/{n} | Misfit: {best_misfit:.4f}")
+
+    # 转为 numpy 数组
+    S_res = np.array(S_res)
+    T_res = np.array(T_res)
+    U_res = np.array(U_res)
     
-    # 5. 保存与绘图
-    base = os.path.splitext(os.path.basename(DATA_FILE_PATH))[0]
-    OUT_DATA = f"STU_GlobalABIC_{base}.dat"
-    np.savetxt(OUT_DATA, np.column_stack((S_fin, T_fin, U_fin, q_res)), header="S T U q1 q2", comments='')
-    print(f"数据已保存: {OUT_DATA}")
+    # 4. 后处理平滑 (解决 PSO 抖动 + 修复报错)
+    print(">>> 正在进行结果平滑...")
     
-    OUT_PNG = f"STU_GlobalABIC_{base}.png"
-    plot_results(dates, S_fin, T_fin, U_fin, q_res, OUT_PNG)
+    # 自动计算安全窗口大小
+    # 必须是奇数，且小于数据长度
+    target_window = 15
+    safe_window = target_window
+    if n < target_window:
+        safe_window = n if n % 2 == 1 else n - 1
+    
+    # 只有当数据点足够多时才平滑
+    if safe_window >= 3:
+        try:
+            S_smooth = savgol_filter(S_res, window_length=safe_window, polyorder=2)
+            T_smooth = savgol_filter(T_res, window_length=safe_window, polyorder=2)
+            U_smooth = savgol_filter(U_res, window_length=safe_window, polyorder=2)
+        except Exception as e:
+            print(f"⚠️ 平滑失败 ({e})，显示原始 PSO 结果。")
+            S_smooth, T_smooth, U_smooth = S_res, T_res, U_res
+    else:
+        print("⚠️ 数据点过少，跳过平滑步骤。")
+        S_smooth, T_smooth, U_smooth = S_res, T_res, U_res
+
+    # 5. 保存结果
+    out_file = file_path.replace(".dat", "_PSO_Result.dat")
+    np.savetxt(out_file, np.column_stack((S_smooth, T_smooth, U_smooth, Q_res)), 
+               header="S T U Misfit", comments='')
+    print(f"✅ 数据已保存: {out_file}")
+
+    # 6. 绘图
+    fig, axes = plt.subplots(4, 1, figsize=(10, 12), sharex=True)
+    
+    # S
+    axes[0].plot(dates, S_res, '.', color='gray', alpha=0.3, label='Raw PSO')
+    axes[0].plot(dates, S_smooth, 'r-', lw=2, label='Smoothed')
+    axes[0].set_ylabel('S (Storage)', fontweight='bold')
+    axes[0].set_yscale('log')
+    axes[0].legend(loc='upper right')
+    axes[0].grid(True, which='both', ls='--', alpha=0.5)
+    
+    # T
+    axes[1].plot(dates, T_smooth, 'b-', lw=1.5)
+    axes[1].set_ylabel('T (Transmissivity)', fontweight='bold')
+    axes[1].set_yscale('log')
+    axes[1].grid(True, which='both', ls='--', alpha=0.5)
+    
+    # U
+    axes[2].plot(dates, U_smooth, 'g-', lw=1.5)
+    axes[2].set_ylabel('U (Leakage)', fontweight='bold')
+    axes[2].set_yscale('log')
+    axes[2].grid(True, which='both', ls='--', alpha=0.5)
+    
+    # Misfit
+    axes[3].plot(dates, Q_res, 'k-', lw=1)
+    axes[3].set_ylabel('Weighted Misfit', fontweight='bold')
+    axes[3].grid(True, which='major', ls='-', alpha=0.5)
+    
+    # 时间轴格式
+    axes[3].xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+    plt.setp(axes[3].xaxis.get_majorticklabels(), rotation=30, ha='right')
+    
+    plt.suptitle(f"PSO Global Inversion: {os.path.basename(file_path)}", fontsize=14)
+    plt.tight_layout()
+    plt.show()
 
 if __name__ == "__main__":
     main()
